@@ -1,0 +1,21 @@
+[package]
+# Semantic Versioning — https://semver.org/
+version = "0.1.0"
+authors = ["Aldrin Inbaraj"]
+title = "omni.kit.mcp.panel"
+description = "Registry-driven control panel for the omni.kit.mcp bridge: one button per registered tool, generated from the same registry agents discover — click == agent call, by construction."
+readme = "docs/README.md"
+repository = ""
+category = "Internal"
+keywords = ["kit", "mcp", "bridge", "panel", "ui"]
+changelog = "docs/CHANGELOG.md"
+
+[dependencies]
+# The bridge whose registry this panel renders and dispatches through.
+"omni.kit.mcp" = {}
+# UI toolkit + the main-thread hop for dispatching from button callbacks.
+"omni.ui" = {}
+"omni.kit.async_engine" = {}
+
+[[python.module]]
+name = "omni_kit_mcp_panel"

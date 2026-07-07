@@ -1,0 +1,23 @@
+[package]
+# Semantic Versioning — https://semver.org/
+version = "0.1.0"
+authors = ["Aldrin Inbaraj"]
+title = "omni.kit.mcp"
+description = "Generic MCP socket bridge: owner/namespace tool registry, NDJSON-over-TCP protocol, main-thread dispatch. One bridge, one port, per Kit process."
+readme = "docs/README.md"
+repository = ""
+category = "Internal"
+keywords = ["kit", "mcp", "bridge", "socket"]
+changelog = "docs/CHANGELOG.md"
+
+[dependencies]
+# REQUIRED — provides run_coroutine for the socket-thread -> main-thread hop.
+"omni.kit.async_engine" = {}
+
+# Public python module: importable as `import omni_kit_mcp` (dots are illegal in module names).
+[[python.module]]
+name = "omni_kit_mcp"
+
+# Bridge settings: every knob's identity (env override + settings keys +
+# precedence) is defined once in omni_kit_mcp/knobs.py; scripts/install.py
+# writes the persistent forms. See the repo README's configuration reference.
