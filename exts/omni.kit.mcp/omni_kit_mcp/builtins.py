@@ -190,7 +190,7 @@ def cmd_status(bridge) -> Dict[str, Any]:
     import socket as _socket
     import time
 
-    from .bridge import _app_identity
+    from .bridge import ADMISSION_CAPABILITY, HOLD_CAPABILITY, _app_identity
 
     ident = _app_identity()
     started = bridge._started_at
@@ -204,6 +204,23 @@ def cmd_status(bridge) -> Dict[str, Any]:
         "uptime_s": round(time.time() - started, 1) if started else None,
         "namespaces": sorted(bridge._namespaces),
         "tools": len(bridge.get_registered_tools(include_internal=True)),
+        # namespace -> sha256 of the serving module's source tree: a client
+        # compares against its local copy to detect the box serving older
+        # code than it expects (fingerprinted at registration/reload).
+        "toolsets": {o["namespace"]: o["metadata"]["source_hash"]
+                     for o in bridge.get_owners().values()
+                     if o["metadata"].get("source_hash")},
+        # The admission contract this bridge speaks, what each tool module declared, and what
+        # is running and waiting — how a caller learns a box holds only one half of the repair.
+        "admission": bridge.admission_report(),
+        # The capability by name, at the top level where a client looks for it without knowing
+        # the report's shape. Absent on a doorway that predates request admission.
+        "doorway_admission": ADMISSION_CAPABILITY,
+        # THE HOLD (`bridge.HOLD_VERB`): whether one stands, whose, why and what it has refused —
+        # never its token. `status` is the one verb a hold does not refuse, so this is readable
+        # by everyone while it stands. The capability string is absent on an older doorway.
+        "hold": bridge.hold_report(),
+        "doorway_hold": HOLD_CAPABILITY,
     })
     return ident
 
@@ -247,14 +264,23 @@ def cmd_reload_tools(bridge, module: str) -> Dict[str, Any]:
 
 def builtin_tools(bridge) -> List:
     """The ToolDefinitions the bridge registers on itself at construction."""
-    from .bridge import ToolDefinition  # deferred: bridge imports this module
+    from .bridge import EXCLUSIVE_ATTRIBUTE, ToolDefinition  # deferred: bridge imports this module
+
+    # `run_python` IS EXCLUSIVE, ALWAYS. Its body is whatever the caller sent, and a body may
+    # advance the simulator from inside the call (`app.update()`, a `World.step`, a composer's
+    # settle) — which destroys every request started beside it. The bridge cannot read the body
+    # to find out, so the verb is given the main loop to itself every time. A body that calls
+    # back into the doorway in-process is refused `DOORWAY_BUSY` at once; a body that pumps while
+    # waiting for a LATER request has that request refused at its deadline, by name, not hung.
+    run_python = functools.partial(cmd_run_python, bridge)
+    setattr(run_python, EXCLUSIVE_ATTRIBUTE, True)
 
     return [
         ToolDefinition(
             name="run_python",
             description=_RUN_PYTHON_DESCRIPTION,
             parameters=_RUN_PYTHON_PARAMETERS,
-            handler=functools.partial(cmd_run_python, bridge),
+            handler=run_python,
         ),
         ToolDefinition(
             name="list_bridges",

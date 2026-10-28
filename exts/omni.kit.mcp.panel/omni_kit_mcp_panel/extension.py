@@ -27,17 +27,21 @@ A new project's tools appear on Refresh the moment its package registers.
 """
 
 import json
+import queue
 from functools import partial
 
 import carb
 import omni.ext
+import omni.kit.app
 import omni.ui as ui
-from omni.kit.async_engine import run_coroutine
 
 from omni_kit_mcp import get_mcp_bridge
 
 WINDOW_TITLE = "MCP Tools"
 _RESULT_MAX_CHARS = 500
+#: How long a click may wait behind a verb that has the main loop to itself before it is
+#: answered DOORWAY_BUSY. A person is watching the panel; half a minute is their patience.
+_CLICK_QUEUE_S = 30.0
 _LABEL_WIDTH = 150
 _ROW_HEIGHT = 22
 
@@ -133,10 +137,15 @@ class McpPanelExtension(omni.ext.IExt):
         self._window = ui.Window(WINDOW_TITLE, width=480, height=760)
         self._fields = {}   # canonical tool name -> [_ParamField]
         self._status = {}   # canonical tool name -> ui.Label
+        self._answers = queue.SimpleQueue()   # (response, show) — see _drain_answers
+        self._answers_sub = (omni.kit.app.get_app().get_update_event_stream()
+                             .create_subscription_to_pop(
+                                 self._drain_answers, name="omni.kit.mcp.panel answers"))
         self._rebuild()
 
     def on_shutdown(self):
         carb.log_info("[omni.kit.mcp.panel] shutdown")
+        self._answers_sub = None
         if self._window:
             self._window.destroy()
             self._window = None
@@ -251,14 +260,32 @@ class McpPanelExtension(omni.ext.IExt):
             return
 
         show("running…")
-        run_coroutine(self._dispatch_and_show(name, params, show))
-
-    async def _dispatch_and_show(self, name: str, params: dict, show):
-        """Through the registry's single entrance — same path as an agent call."""
+        # THROUGH ADMISSION, AS DATA — never `run_coroutine(bridge.dispatch(...))`. A click can
+        # land while another verb is pumping the main loop (the UI is drawn inside that pump),
+        # and a task created there is destroyed unanswered: the same loss a second socket client
+        # suffered. `submit_local` queues the click exactly as a socket request is queued.
         try:
-            response = await get_mcp_bridge().dispatch(name, params)
+            get_mcp_bridge().submit_local(
+                name, params, lambda response: self._answers.put((response, show)),
+                queue_s=_CLICK_QUEUE_S)
         except Exception as e:
-            response = {"status": "error", "message": str(e)}
+            self._show_response({"status": "error", "message": str(e)}, show)
+
+    def _drain_answers(self, _event=None):
+        """Show what has been answered, on the main thread.
+
+        An answer arrives on the main thread, but a `DOORWAY_BUSY` refusal arrives on the
+        bridge's watch thread, and omni.ui is main-thread only. So both are queued and shown
+        from the app's update stream, which fires on the main thread — including inside a pump.
+        """
+        while True:
+            try:
+                response, show = self._answers.get_nowait()
+            except queue.Empty:
+                return
+            self._show_response(response, show)
+
+    def _show_response(self, response: dict, show):
         ok = response.get("status") == "success"
         body = response.get("result") if ok else response.get("message", "error")
         text = body if isinstance(body, str) else json.dumps(body, default=repr)

@@ -20,4 +20,4 @@ name = "omni_kit_mcp"
 
 # Bridge settings: every knob's identity (env override + settings keys +
 # precedence) is defined once in omni_kit_mcp/knobs.py; scripts/install.py
-# writes the persistent forms. See the repo README's configuration reference.
+# writes the persistent forms. See docs/configuration.md in the repository.

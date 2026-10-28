@@ -162,7 +162,8 @@ def test_unregister_during_inflight_drains():
             await asyncio.sleep(0.01)
         return {"done": True}
 
-    bridge.register_owner("A", "a", metadata={"module": "modA"}).add(td("slow", slow))
+    bridge.register_owner("A", "a", metadata={"module": "modA", "admission": 1}).add(
+        td("slow", slow))
 
     async def scenario():
         task = asyncio.ensure_future(bridge.dispatch("a.slow", {}))
@@ -262,7 +263,10 @@ def test_socket_two_clients_isolated():
             c2.close()
 
 
-def test_socket_pipelined_frames_in_one_packet():
+def test_socket_second_frame_before_the_first_answer_is_refused_in_order():
+    """The protocol has no request ids, so a connection carries one request at a time. A frame
+    sent before the previous one is answered is refused by name — and AFTER that answer, so the
+    two replies cannot be read the wrong way round."""
     with LiveBridge() as live:
         live.bridge.register_owner("A", "demo").add(
             td("echo", lambda n=0: {"n": n}, params={"n": {"type": "integer"}}))
@@ -273,7 +277,11 @@ def test_socket_pipelined_frames_in_one_packet():
             while buf.count(b"\n") < 2:
                 buf += c.recv(65536)
             replies = [json.loads(x) for x in buf.strip().split(b"\n")]
-            assert sorted(r["result"]["n"] for r in replies) == [1, 2]
+            assert replies[0] == {"status": "success", "result": {"n": 1}}
+            assert replies[1]["status"] == "error"
+            assert replies[1]["refusal"] == "DOORWAY_PIPELINED"
+            # the connection is still good for the next request
+            assert roundtrip(c, {"type": "demo.echo", "params": {"n": 3}})["result"] == {"n": 3}
 
 
 # ==================== owner windows (reload-safe UI) ====================
@@ -411,7 +419,7 @@ def test_start_sweeps_stale_portfiles(tmp_path, monkeypatch):
 
 
 def test_portfile_removed_at_exit_even_without_stop(tmp_path):
-    """The observed failure mode (dual-a4500, headless Isaac 5.1): app close()
+    """Headless Isaac 5.1's app close()
     skips extension on_shutdown, so stop() never runs — the atexit hook must
     still unadvertise on normal interpreter exit."""
     import glob
@@ -477,3 +485,19 @@ def test_stat_file_verifies_content(tmp_path):
     r = dispatch(bridge, "stat_file", {"path": str(p)})["result"]
     assert r["exists"] and r["bytes"] == len(payload)
     assert r["sha256"] == hashlib.sha256(payload).hexdigest()
+
+def test_error_envelope_names_the_exception_class():
+    """Typed errors: a handler exception surfaces with its class name, so a
+    client can branch on error KIND without parsing the message."""
+    bridge = make_bridge()
+    reg = bridge.register_owner(owner_id="err_owner", namespace="err")
+
+    @reg.tool("always raises", {})
+    def boom():
+        raise ValueError("kaput")
+
+    r = dispatch(bridge, "err.boom")
+    assert r["status"] == "error"
+    assert r["error_type"] == "ValueError"
+    assert r["message"] == "kaput"
+    assert "ValueError: kaput" in r["traceback"]

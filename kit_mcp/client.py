@@ -1,7 +1,7 @@
 """Reference client for the omni.kit.mcp bridge — stdlib-only, single-file.
 
 The one implementation of the caller side of the wire protocol (NDJSON over
-TCP; see the repo README): framing, envelope decoding, connection health, and
+TCP; see docs/protocol.md): framing, envelope decoding, connection health, and
 retry live here and nowhere else. Every consumer — the MCP gateway, tests,
 doctors, project scripts — either imports this module or copies this file
 (single-file, stdlib-only, no intra-package imports is part of its contract).
@@ -48,6 +48,7 @@ Exit codes: 0 = success · 1 = bridge answered with an error ·
 
 import json
 import os
+import secrets
 import socket
 from typing import Any, Dict, Optional
 
@@ -60,6 +61,45 @@ PORT_ENV = "OMNI_KIT_MCP_PORT"
 HOST_ENV = "OMNI_KIT_MCP_HOST"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_TIMEOUT = 300.0
+
+
+#: THE QUEUE BUDGET. The bridge runs one frame-advancing verb at a time and keeps a request that
+#: arrives meanwhile in a queue — but only for as long as the request SAYS it may wait
+#: (`queue_s` on the frame). A request that states nothing starts at once or is refused at once
+#: with `DOORWAY_BUSY`. The budget is this caller's to state because only the caller knows its
+#: own patience: its timeout, less the time the verb needs to RUN once started (the execution
+#: reserve), less a margin for the refusal itself to arrive while the caller is still listening.
+REFUSAL_MARGIN_S = 1.0
+#: With no reserve stated, half of the timeout is kept for the verb to run.
+DEFAULT_RESERVE_FRACTION = 0.5
+#: `BridgeError.details["refusal"]` when the bridge is alive and occupied. NOT unreachable: a
+#: health probe that reads this as a dead cell tears down a healthy run.
+BUSY = "DOORWAY_BUSY"
+
+#: THE HOLD, caller side (the bridge's `HOLD_VERB`; names pinned to the bridge by test, never by
+#: import). While a hold stands, the bridge refuses every frame that does not carry its token as
+#: `HELD`. A process that is the holder's own work — the holder and every subprocess it starts —
+#: carries the token in this variable, and every frame this client sends from that process
+#: carries it at the frame's top level (`HOLD_FIELD`), never inside `params`.
+HOLD_TOKEN_ENV = "OMNI_KIT_MCP_HOLD_TOKEN"
+#: A FILE holding the token, read on EVERY call, for a LONG-LIVED process started before any hold
+#: existed — a service whose environment was fixed at start-up and that the holder means to let
+#: through. The holder writes the file while it holds and removes it on release; absent, no token
+#: is sent, and that service is refused like any other caller under the hold.
+HOLD_TOKEN_FILE_ENV = "OMNI_KIT_MCP_HOLD_TOKEN_FILE"
+HOLD_VERB = "doorway.hold"
+RELEASE_VERB = "doorway.release"
+HOLD_FIELD = "hold"
+HOLD_CAPABILITY = "hold-v1"
+HELD = "DOORWAY_HELD"
+
+
+def queue_budget(timeout: float, execution_reserve_s: Optional[float] = None) -> float:
+    """The `queue_s` a request states for a call with this timeout and execution reserve."""
+    timeout = float(timeout)
+    reserve = (timeout * DEFAULT_RESERVE_FRACTION if execution_reserve_s is None
+               else float(execution_reserve_s))
+    return max(0.0, timeout - reserve - REFUSAL_MARGIN_S)
 
 
 class BridgeError(Exception):
@@ -157,6 +197,45 @@ def _decode(envelope: Dict[str, Any]) -> Any:
     raise BridgeError(envelope.get("message", "bridge error"), details)
 
 
+#: A declared token file that exists and cannot be used (empty, unreadable): raised, never read as
+#: "no hold" — a frame sent tokenless by mistake would be refused under the hold it meant to pass.
+HOLD_TOKEN_UNREADABLE = "DOORWAY_HOLD_TOKEN_UNREADABLE"
+
+
+class HoldTokenUnreadable(RuntimeError):
+    def __init__(self, detail: str) -> None:
+        self.code = HOLD_TOKEN_UNREADABLE
+        super().__init__(f"{HOLD_TOKEN_UNREADABLE}: {detail}")
+
+
+def hold_token(environ: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """The hold token this process's frames carry, or None.
+
+    PRECEDENCE: `HOLD_TOKEN_ENV` (the holder's own process and its subprocesses) wins; else the
+    contents of the file `HOLD_TOKEN_FILE_ENV` names, read NOW, on every call — the route of a
+    long-lived platform service whose environment was fixed before any hold. An ABSENT file is no
+    token (no hold stands); a file that EXISTS and is empty or unreadable raises
+    `HoldTokenUnreadable`. A stale file from an earlier hold is harmless: the bridge ignores a token
+    when no hold stands and compares it with the current one when one does."""
+    environ = os.environ if environ is None else environ
+    token = environ.get(HOLD_TOKEN_ENV)
+    if token:
+        return token
+    path = environ.get(HOLD_TOKEN_FILE_ENV)
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="ascii") as handle:
+            token = handle.read().strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as error:
+        raise HoldTokenUnreadable(f"{path}: {type(error).__name__}: {error}") from None
+    if not token:
+        raise HoldTokenUnreadable(f"{path} is empty")
+    return token
+
+
 class BridgeClient:
     """Persistent connection: one socket, health-checked, reconnecting.
 
@@ -238,9 +317,16 @@ class BridgeClient:
 
     # -- the roundtrip (the only place framing/decoding happens) --
 
-    def _roundtrip(self, tool: str, params: Dict[str, Any], timeout: float) -> Any:
+    def _roundtrip(self, tool: str, params: Dict[str, Any], timeout: float,
+                   execution_reserve_s: Optional[float] = None) -> Any:
         self._sock.settimeout(timeout)
-        frame = json.dumps({"type": tool, "params": params}).encode("utf-8") + b"\n"
+        request = {"type": tool, "params": params}
+        token = hold_token()
+        if token:
+            request[HOLD_FIELD] = token
+        if timeout is not None:          # a caller with no timeout states no budget either
+            request["queue_s"] = queue_budget(timeout, execution_reserve_s)
+        frame = json.dumps(request).encode("utf-8") + b"\n"
         self._sock.sendall(frame)
         while b"\n" not in self._buffer:
             chunk = self._sock.recv(65536)
@@ -251,8 +337,15 @@ class BridgeClient:
         return _decode(json.loads(line.decode("utf-8")))
 
     def call(self, tool: str, params: Optional[Dict[str, Any]] = None, *,
-             timeout: Optional[float] = None) -> Any:
-        """Call one tool; returns the payload or raises (see module docstring)."""
+             timeout: Optional[float] = None,
+             execution_reserve_s: Optional[float] = None) -> Any:
+        """Call one tool; returns the payload or raises (see module docstring).
+
+        `execution_reserve_s` is how long the tool may run once started; the rest of the timeout
+        (less a margin) is what the request may spend queued behind another verb. Unstated, half
+        the timeout is reserved. A request that cannot start inside its queue budget raises
+        `BridgeError` whose ``details["refusal"]`` is ``"DOORWAY_BUSY"`` — the bridge is alive
+        and occupied, and the tool did NOT run."""
         params = params or {}
         t = self.timeout if timeout is None else timeout
         if not self._healthy():
@@ -260,7 +353,7 @@ class BridgeClient:
         for attempt in (0, 1):
             try:
                 self.connect()
-                return self._roundtrip(tool, params, t)
+                return self._roundtrip(tool, params, t, execution_reserve_s)
             except socket.timeout:
                 self.close()   # response may still arrive on the old socket
                 raise TimeoutError(
@@ -272,12 +365,75 @@ class BridgeClient:
                     raise
 
 
+class DoorwayHold:
+    """Hold the doorway for one piece of work; every other caller is refused `DOORWAY_HELD`.
+
+        with DoorwayHold("evaluate-planner", "evaluating ticket 3", port=9010) as hold:
+            env = {**os.environ, HOLD_TOKEN_ENV: hold.token}   # the work's own subprocesses
+            ...
+        hold.released   # the bridge's account: how long, and what it refused, by tool
+
+    ONE CONNECTION, KEPT OPEN FOR THE WHOLE HOLD, AND THE HOLD LIVES EXACTLY AS LONG AS IT: the
+    bridge releases a hold whose connection closes, so a holder that is killed cannot strand the
+    doorway. `release()` asks for the release explicitly (and returns the bridge's counts); the
+    socket is closed whatever that answer was.
+    """
+
+    def __init__(self, holder: str, reason: str, *, host: Optional[str] = None,
+                 port: Optional[int] = None, timeout: float = 30.0):
+        self.holder, self.reason = holder, reason
+        self.token = secrets.token_hex(32)
+        self.placed: Optional[Dict[str, Any]] = None
+        self.released: Optional[Dict[str, Any]] = None
+        #: Why the explicit release went unanswered, when it did. The hold is released anyway (its
+        #: connection is closed), so this is evidence lost, never a hold left standing.
+        self.release_error: Optional[str] = None
+        self._client = BridgeClient(host=host, port=port, timeout=timeout)
+        self._timeout = timeout
+
+    def place(self) -> Dict[str, Any]:
+        """Place the hold on a fresh connection; raises `BridgeError` when the bridge refuses."""
+        self._client.connect()
+        try:
+            self.placed = self._client._roundtrip(
+                HOLD_VERB, {"token": self.token, "holder": self.holder, "reason": self.reason},
+                self._timeout)
+        except BaseException:
+            self._client.close()
+            raise
+        return self.placed
+
+    def release(self) -> Optional[Dict[str, Any]]:
+        """Ask for the release, then close the connection — which releases it regardless."""
+        try:
+            if self._client._sock is not None and self.released is None:
+                self.released = self._client._roundtrip(
+                    RELEASE_VERB, {"token": self.token}, self._timeout)
+        finally:
+            self._client.close()
+        return self.released
+
+    def __enter__(self) -> "DoorwayHold":
+        self.place()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        try:
+            self.release()
+        except Exception as error:                                            # noqa: BLE001
+            # THE CLOSE IN `release` RELEASED IT: an explicit release that could not be answered
+            # is not a hold that stands. Recorded by name, never raised over the work's own result.
+            self.release_error = f"{type(error).__name__}: {error}"
+
+
 def call(tool: str, params: Optional[Dict[str, Any]] = None, *,
          host: Optional[str] = None, port: Optional[int] = None,
-         timeout: float = DEFAULT_TIMEOUT) -> Any:
+         timeout: float = DEFAULT_TIMEOUT,
+         execution_reserve_s: Optional[float] = None) -> Any:
     """One-shot call: fresh socket, fitted timeout, closed afterwards."""
     with BridgeClient(host=host, port=port, timeout=timeout) as client:
-        return client.call(tool, params, timeout=timeout)
+        return client.call(tool, params, timeout=timeout,
+                           execution_reserve_s=execution_reserve_s)
 
 
 # ==================== CLI ====================

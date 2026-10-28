@@ -2,16 +2,19 @@
 
 One bridge, one port, per Kit process. on_startup: build the singleton, arm
 the run_python session staleness guard (stage-open -> clear), load the
-configured tool packages (autoload.py), bind the socket. Consumers never
+configured tool packages (autoload.py) — every one, or the doorway refuses to
+boot (autoload.ToolModuleLoadRefusal) — bind the socket. Consumers never
 call start()/stop() — projects are plain tool packages registered persistently
 via ``scripts/install.py add-project`` (or per-launch via KIT_MCP_TOOL_* env).
 
 Port resolution follows knobs.PORT and the bind address knobs.BIND (env
 override, else persistent settings — see knobs.py, the single home of every
 knob's identity; BIND defaults to localhost because the bridge serves
-run_python). If the configured port is already taken — a second instance of
-the same app — the bridge falls back to an OS-assigned ephemeral port and
-advertises it via its runtime portfile, so discovery still finds it.
+run_python).
+
+A DECLARED bind that fails REFUSES, naming the address and the errno's own
+meaning (bind.py). It never falls back to another port: a bridge that moved
+would be one no client can find.
 
 No port configured => the socket stays down (logged); tool modules requested
 with no port is a hard error, since registering tools nobody can reach is
@@ -22,7 +25,9 @@ import carb
 import omni.ext
 
 from . import knobs
-from .autoload import has_autoload_request, load_tool_modules
+from .bind import declared_bind_refusal
+from .autoload import (ToolModuleLoadRefusal, has_autoload_request,
+                       load_configured_tool_modules, refuse_boot)
 from .bridge import _create_bridge, _destroy_bridge
 
 
@@ -49,22 +54,31 @@ class McpBridgeExtension(omni.ext.IExt):
         bridge = _create_bridge()
         self._stage_sub = _guard_sessions_against_stage_open(bridge)
 
-        results = load_tool_modules(bridge) if has_autoload_request() else {}
+        try:
+            results = load_configured_tool_modules(bridge) if has_autoload_request() else {}
+        except ToolModuleLoadRefusal as refusal:
+            # NO SKIP. The socket below is never bound: a doorway that came up without a
+            # configured namespace would answer 'unknown tool' long after the cause.
+            # The record + quit are what turn this into a boot failure for whoever is waiting,
+            # instead of a readiness deadline with no cause in it.
+            self._stage_sub = None
+            _destroy_bridge()
+            refuse_boot(refusal)
+            raise
 
         port = _resolve_port()
         bind_host = knobs.BIND.read() or "localhost"
         if port:
             try:
                 bridge.start(port, host=bind_host)
-            except OSError:
-                # Another Kit process already holds the configured port (e.g. a
-                # second instance of the same app). Fall back to an ephemeral
-                # port — the portfile advertises it, so discovery still finds us.
-                carb.log_warn(
-                    f"[omni.kit.mcp] port {port} is taken (another instance?) — "
-                    f"binding an ephemeral port instead; clients discover it via "
-                    f"the runtime portfile or --list-bridges.")
-                bridge.start(0, host=bind_host)
+            except OSError as error:
+                # NO FALLBACK. The address was DECLARED and a client is going to dial
+                # exactly it; a bridge that quietly moved would be a bridge nobody can
+                # find. The errno decides what the log says, because "the address does
+                # not exist" and "the port is taken" send a reader to different places.
+                refusal = declared_bind_refusal(bind_host, port, error)
+                carb.log_error(f"[omni.kit.mcp] {refusal}")
+                raise refusal from error
             carb.log_info(
                 f"[omni.kit.mcp] bridge on port {bridge._port}; tool modules: {results or 'none'}")
         elif results:

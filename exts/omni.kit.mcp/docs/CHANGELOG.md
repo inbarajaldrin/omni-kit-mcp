@@ -3,6 +3,30 @@
 All notable changes to this extension are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+- Declared toolsets: a tool package with no `register()` entrypoint is
+  introspected — every public function (or exactly `__all__`) registers as a
+  tool, schema from type hints/defaults, description from the docstring, sync
+  or async. `register_toolset(bridge, module)` is the programmatic form.
+- `status` builtin: instance identity (pid, port, bind host,
+  headless-vs-headful, app + version, uptime, namespaces) plus per-namespace
+  `source_hash` of the served module tree for staleness detection. The
+  runtime portfile advertises the same identity.
+- `stat_file` builtin (exists/bytes/sha256) completing the
+  `put_file`/`get_file` file data plane; `examples/remote_driver.py`
+  ensure->reload->dispatch driver template.
+- Error envelopes carry `error_type` (the exception class name) alongside
+  message and traceback.
+
+### Fixed
+- Stale portfile lifecycle: dead-pid sweep at every bridge start plus an
+  atexit backstop (Kit's fast shutdown skips extension shutdown AND atexit),
+  with client-side pruning on discovery.
+- Reload purge exempts only the module named exactly `_state`, not any
+  `*_state` suffix — a tool module named e.g. `read_state` reloads normally.
+
 ## [0.1.0] - 2026-07-04
 
 ### Added

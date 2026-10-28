@@ -6,7 +6,16 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    # Upper bound <2: mcp 2 renamed FastMCP to MCPServer and removed
+    # `mcp.server.fastmcp`, which kit_mcp/server.py imports.
+    "mcp[cli]>=1.0.0,<2",
+]
+
+# The doorway's own test interpreter (`pip install -e '.[test]'`); the platform
+# verifier refuses an interpreter that cannot import pytest.
+[project.optional-dependencies]
+test = [
+    "pytest",
 ]
 
 # LLM-facing MCP server entry point (the TCP client to the Kit bridge).

@@ -24,6 +24,9 @@ merely ends in ``_state`` (e.g. ``read_state``) reloads normally.
 """
 
 MCP_NAMESPACE = "demo"
+#: Written against the bridge's request-admission contract (README, "Request admission"). A
+#: package that declares nothing has its tools refused: its frame-pumping tools would be unmarked.
+DOORWAY_ADMISSION = 1
 
 
 def register(registrar):

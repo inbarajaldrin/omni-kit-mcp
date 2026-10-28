@@ -44,6 +44,7 @@ def dispatch(bridge, name, params=None):
 def test_load_registers_namespace_and_tools(bridge, tool_dir):
     tool_dir("pkg_a", """
         MCP_NAMESPACE = "pa"
+        DOORWAY_ADMISSION = 1
         def register(registrar):
             @registrar.tool("hello tool", {})
             def hello():
@@ -69,6 +70,7 @@ def test_namespace_defaults_to_module_name(bridge, tool_dir):
 def test_bad_module_is_isolated_and_rolled_back(bridge, tool_dir):
     tool_dir("good_pkg", """
         MCP_NAMESPACE = "good"
+        DOORWAY_ADMISSION = 1
         def register(registrar):
             @registrar.tool("t", {})
             def t():
@@ -76,6 +78,7 @@ def test_bad_module_is_isolated_and_rolled_back(bridge, tool_dir):
     """)
     tool_dir("bad_pkg", """
         MCP_NAMESPACE = "bad"
+        DOORWAY_ADMISSION = 1
         def register(registrar):
             @registrar.tool("t", {})
             def t():
@@ -88,7 +91,10 @@ def test_bad_module_is_isolated_and_rolled_back(bridge, tool_dir):
     results = load_tool_modules(
         bridge, modules=["bad_pkg", "no_entry", "good_pkg"], paths=[])
     assert str(results["bad_pkg"]).startswith("ERROR")
-    assert "entrypoint" in str(results["no_entry"])
+    # A package without register() is a DECLARED TOOLSET (its public
+    # functions become the tools). One with neither an entrypoint nor public
+    # functions has nothing to serve, and says so.
+    assert "no public functions" in str(results["no_entry"])
     assert results["good_pkg"]["tools"] == ["good.t"]
     # bad_pkg's half-registration was rolled back: namespace + owner freed
     assert "bad.t" not in bridge.get_registered_tools()
@@ -98,6 +104,7 @@ def test_bad_module_is_isolated_and_rolled_back(bridge, tool_dir):
 def test_reload_picks_up_new_code_and_preserves_state(bridge, tool_dir):
     pkg = tool_dir("re_pkg", """
         MCP_NAMESPACE = "re"
+        DOORWAY_ADMISSION = 1
         from . import _state, read_state
         def register(registrar):
             @registrar.tool("version", {})
@@ -113,6 +120,7 @@ def test_reload_picks_up_new_code_and_preserves_state(bridge, tool_dir):
     sys.modules["re_pkg._state"].COUNTER = 99
     (pkg / "__init__.py").write_text(textwrap.dedent("""
         MCP_NAMESPACE = "re"
+        DOORWAY_ADMISSION = 1
         from . import _state, read_state
         def register(registrar):
             @registrar.tool("version", {})
@@ -136,6 +144,7 @@ def test_reload_picks_up_new_code_and_preserves_state(bridge, tool_dir):
 def test_reload_of_never_loaded_module_loads_fresh(bridge, tool_dir):
     tool_dir("late_pkg", """
         MCP_NAMESPACE = "late"
+        DOORWAY_ADMISSION = 1
         def register(registrar):
             @registrar.tool("t", {})
             def t():
@@ -144,3 +153,62 @@ def test_reload_of_never_loaded_module_loads_fresh(bridge, tool_dir):
     info = reload_tool_module(bridge, "late_pkg")
     assert info["namespace"] == "late"
     assert dispatch(bridge, "late.t")["result"] == {"late": True}
+
+
+# ------------------------------------------------------------------ the optional policy hook
+def test_a_declared_toolset_can_install_a_policy_without_giving_up_its_tools(bridge, tool_dir):
+    """The reason this is a SECOND entrypoint. A package whose public functions are its tools has
+    no `register()` to hook from, and it should not have to become an entrypoint package — losing
+    the derived tools — just to say which calls may not run."""
+    tool_dir("pol_pkg", '''
+        MCP_NAMESPACE = "pol"
+        DOORWAY_ADMISSION = 1
+
+        def do_a_thing():
+            return {"did": True}
+
+        def install_policy(registrar):
+            registrar.refuse_calls_with(lambda name, params: "refused by the package")
+        ''')
+    loaded = load_tool_modules(bridge, ["pol_pkg"])
+
+    assert "pol.do_a_thing" in loaded["pol_pkg"]["tools"], "the declared tools are still there"
+    assert bridge.pre_dispatch_hooks() == 1
+
+    answer = asyncio.run(bridge.dispatch("pol.do_a_thing", {}))
+    assert answer.get("refused") is True
+    assert "refused by the package" in answer["message"]
+
+
+def test_a_package_with_no_policy_installs_none(bridge, tool_dir):
+    tool_dir("nopol_pkg", '''
+        MCP_NAMESPACE = "nopol"
+        DOORWAY_ADMISSION = 1
+
+        def do_a_thing():
+            return {"did": True}
+        ''')
+    load_tool_modules(bridge, ["nopol_pkg"])
+    assert bridge.pre_dispatch_hooks() == 0
+    assert asyncio.run(bridge.dispatch("nopol.do_a_thing", {}))["result"] == {"did": True}
+
+
+def test_a_policy_that_cannot_install_FAILS_THE_LOAD(bridge, tool_dir):
+    """A package whose tools registered and whose gate did not is the shape that looks armed and
+    is not — the exact failure this whole task exists to remove. So it is not skipped."""
+    tool_dir("badpol_pkg", '''
+        MCP_NAMESPACE = "badpol"
+        DOORWAY_ADMISSION = 1
+
+        def do_a_thing():
+            return {"did": True}
+
+        def install_policy(registrar):
+            raise RuntimeError("the profile was unreadable")
+        ''')
+    loaded = load_tool_modules(bridge, ["badpol_pkg"])
+    assert str(loaded["badpol_pkg"]).startswith("ERROR"), loaded
+    assert "unreadable" in str(loaded["badpol_pkg"])
+    assert bridge.pre_dispatch_hooks() == 0
+    # And the tools go with it: a half-loaded package must not leave callable tools behind.
+    assert asyncio.run(bridge.dispatch("badpol.do_a_thing", {}))["status"] == "error"

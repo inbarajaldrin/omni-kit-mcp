@@ -21,11 +21,19 @@ Canonical bridge names are ``<namespace>.<tool>``; MCP tool names cannot
 contain dots, so they are exposed as ``<namespace>__<tool>`` and mapped back
 on dispatch.
 
-Project-specific POLICY plugs in via two hook lists (it must not live here):
+Project-specific POLICY plugs in via three hook lists (it must not live here):
   - register_pre_dispatch_hook(fn): fn(name, params) -> Optional[str]
         May mutate params in place and/or return a refusal string to BLOCK.
+  - register_post_dispatch_hook(fn): fn(name, params, result) -> Optional[str]
+        Sees every outcome and may return a replacement result (e.g. the same
+        answer with a condition of the world annotated onto it), or None to
+        leave it. Runs on bridge answers, bridge errors, and pre-hook refusals
+        alike — a call that just failed is when a caller most needs telling.
   - register_meta_category_hook(fn): fn(name) -> Optional[str]
         Returns an MCP ``_meta`` category for a tool name, or None.
+
+``kit_mcp.gate`` is the mechanism a policy hook can be written against: a pure
+deny-gate over a declared policy file. It, too, holds no policy.
 """
 
 import json
@@ -65,6 +73,7 @@ def _builtins_enabled() -> bool:
 
 # ---- Policy hooks (populated by the host project; empty => pure passthrough) ----
 _PRE_DISPATCH_HOOKS: List[Callable[[str, Dict[str, Any]], Optional[str]]] = []
+_POST_DISPATCH_HOOKS: List[Callable[[str, Dict[str, Any], str], Optional[str]]] = []
 _META_CATEGORY_HOOKS: List[Callable[[str], Optional[str]]] = []
 
 
@@ -72,6 +81,18 @@ def register_pre_dispatch_hook(fn: Callable[[str, Dict[str, Any]], Optional[str]
     """Register a pre-dispatch policy hook. fn(name, params) may mutate params
     and return a refusal string to block, or None to proceed."""
     _PRE_DISPATCH_HOOKS.append(fn)
+
+
+def register_post_dispatch_hook(
+        fn: Callable[[str, Dict[str, Any], str], Optional[str]]) -> None:
+    """Register a post-dispatch policy hook. fn(name, params, result) may return
+    a replacement result, or None to leave it as is.
+
+    It sees every outcome of the call — the bridge's answer, a bridge error, and
+    a refusal a pre-dispatch hook returned — because a caller most needs to be
+    told the state of the world on the calls that did not work. Hooks run in
+    registration order and each sees the previous one's result."""
+    _POST_DISPATCH_HOOKS.append(fn)
 
 
 def register_meta_category_hook(fn: Callable[[str], Optional[str]]) -> None:
@@ -104,6 +125,15 @@ _NAME_MAP: Dict[str, str] = {}
 # detect schema/description changes (reload_tools on the bridge side) and
 # re-register instead of silently serving a stale schema.
 _REGISTERED_META: Dict[str, Dict[str, Any]] = {}
+
+
+def registered_tools() -> List[str]:
+    """The canonical bridge names currently registered, sorted.
+
+    The roster a policy's matchers can be checked against: a gate naming a tool this does not
+    list is gating nothing. Empty before discovery has run, which is itself worth knowing —
+    checking a policy against a roster nobody has filled would clear every name in it."""
+    return sorted(_NAME_MAP.values())
 
 
 def _mcp_name(canonical: str) -> str:
@@ -204,13 +234,25 @@ def _build_tool_function(name: str, canonical: str, description: str,
 
 
 def _tool_implementation(canonical: str, params: Dict[str, Any]) -> str:
-    """Shared implementation for all dynamic tools."""
-    # Drop unset optional params so bridge-side handler defaults apply.
-    params = {k: v for k, v in params.items() if v is not None}
+    """Shared implementation for all dynamic tools.
 
-    # Pre-dispatch policy hooks (host project plugs these in): each may mutate
-    # params in place and/or return a refusal string to BLOCK the call. A buggy
-    # hook degrades to an error string rather than crashing the dispatch.
+    Every call crosses both policy hook lists, which is the point of putting them
+    here: this is where every path lands, raw-socket callers included. The result
+    a post-dispatch hook sees is the one the caller would have received, whatever
+    produced it."""
+    # Drop unset optional params so bridge-side handler defaults apply — and so a
+    # policy hook judges the call the bridge will actually receive rather than the
+    # signature's placeholders.
+    params = {k: v for k, v in params.items() if v is not None}
+    return _post_dispatch(canonical, params, _dispatch(canonical, params))
+
+
+def _dispatch(canonical: str, params: Dict[str, Any]) -> str:
+    """Run the pre-dispatch hooks and, if none refused, the bridge call."""
+    # Each hook may mutate params in place and/or return a refusal string to BLOCK
+    # the call. A buggy hook degrades to an error string rather than crashing the
+    # dispatch — and blocks, because a policy that did not run is not a policy that
+    # allowed anything.
     for hook in _PRE_DISPATCH_HOOKS:
         try:
             blocked = hook(canonical, params)
@@ -231,6 +273,23 @@ def _tool_implementation(canonical: str, params: Dict[str, Any]) -> str:
     except (OSError, TimeoutError, RuntimeError) as e:
         logger.error(f"Error in {canonical}: {e}")
         return f"Error: {e}"
+
+
+def _post_dispatch(canonical: str, params: Dict[str, Any], result: str) -> str:
+    """Let each post-dispatch hook replace the result, in registration order.
+
+    A hook that raises is reported and skipped, never allowed to cost the caller an
+    answer the bridge already gave: an annotation failing is not the call failing."""
+    for hook in _POST_DISPATCH_HOOKS:
+        try:
+            replacement = hook(canonical, params, result)
+        except Exception as e:
+            hook_name = getattr(hook, "__name__", repr(hook))
+            logger.error(f"Post-dispatch hook {hook_name} raised for {canonical}: {e}")
+            continue
+        if replacement is not None:
+            result = replacement
+    return result
 
 
 def register_dynamic_tool(server: FastMCP, name: str, canonical: str,

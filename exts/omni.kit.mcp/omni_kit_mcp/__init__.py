@@ -7,6 +7,7 @@ Public API:
     OwnerRegistrar                  # owner-bound registration facade (what register() receives)
     ToolError                       # handler-raised failure with structured diagnostics
     load_tool_modules / reload_tool_module / prepend_tool_paths  # autoload machinery
+    register_toolset                # declared toolset: a module's public functions ARE the tools
 """
 
 import importlib.util as _ilu
@@ -14,6 +15,7 @@ import importlib.util as _ilu
 from .autoload import load_tool_modules, prepend_tool_paths, reload_tool_module
 from .bridge import McpBridge, OwnerRegistrar, ToolDefinition, get_mcp_bridge
 from .protocol import ToolError
+from .toolset import register_toolset
 
 # extension.py is Kit-only (carb + omni.ext). Import it only when running inside
 # Kit, so the package's pure-stdlib surface stays importable off-Kit for lint /
@@ -35,4 +37,5 @@ __all__ = [
     "load_tool_modules",
     "reload_tool_module",
     "prepend_tool_paths",
+    "register_toolset",
 ]
