@@ -52,7 +52,12 @@ def test_a_completed_counter_survives_immediate_process_death(tmp_path):
         f"Sink({str(path)!r}).record('run_python', {{}}, 1.0, {{'status':'success'}})\n"
         "os._exit(17)\n"
     )
-    died = subprocess.run([sys.executable, "-c", code], env=os.environ.copy())
+    # The child imports omni_kit_mcp, which is importable here only through conftest.py's sys.path insert of the
+    # extension root -- a child does not inherit that, so it is handed the same root explicitly.
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [os.path.dirname(os.path.dirname(telemetry.__file__)),
+                                                      env.get("PYTHONPATH")]))
+    died = subprocess.run([sys.executable, "-c", code], env=env)
 
     assert died.returncode == 17
     assert json.loads(path.read_text())["tool"] == "run_python"

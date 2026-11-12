@@ -19,7 +19,14 @@ would be one no client can find.
 No port configured => the socket stays down (logged); tool modules requested
 with no port is a hard error, since registering tools nobody can reach is
 always a misconfig.
+
+An explicit OMNI_KIT_MCP_PORT=0 is not "no port": it asks the bridge to bind a
+port the kernel chooses and advertise it in its portfile (bridge.start), so
+several Kits started at once on one host never reach for the same number. A
+persisted setting of 0 still means no port.
 """
+
+from typing import Optional
 
 import carb
 import omni.ext
@@ -31,19 +38,23 @@ from .autoload import (ToolModuleLoadRefusal, has_autoload_request,
 from .bridge import _create_bridge, _destroy_bridge
 
 
-def _resolve_port() -> int:
-    """Configured bridge port (knobs.PORT precedence), or 0 if unset."""
+def _resolve_port() -> Optional[int]:
+    """Configured bridge port (knobs.PORT precedence): None if unset, 0 if the
+    environment asks for a port the kernel chooses, else the port."""
     env = knobs.PORT.read_env()
     if env:
         try:
-            return int(env)
+            port = int(env)
         except ValueError:
             raise RuntimeError(f"{knobs.PORT.env} is not an integer: {env!r}")
+        if port < 0:
+            raise RuntimeError(f"{knobs.PORT.env} is not a port: {env!r}")
+        return port
     value = knobs.PORT.read_settings()
     try:
-        return int(value) if value else 0
+        return int(value) or None if value else None
     except (TypeError, ValueError):
-        return 0
+        return None
 
 
 class McpBridgeExtension(omni.ext.IExt):
@@ -68,7 +79,7 @@ class McpBridgeExtension(omni.ext.IExt):
 
         port = _resolve_port()
         bind_host = knobs.BIND.read() or "localhost"
-        if port:
+        if port is not None:
             try:
                 bridge.start(port, host=bind_host)
             except OSError as error:

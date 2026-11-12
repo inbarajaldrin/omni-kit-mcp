@@ -31,13 +31,18 @@ box.
 Front-end (`kit-mcp`) env: `OMNI_KIT_MCP_PORT` (optional — auto-discovered
 when exactly one bridge runs; set it to pin a process), `OMNI_KIT_MCP_HOST`,
 `KIT_MCP_NAMESPACE` (comma allowlist), `KIT_MCP_BUILTINS` (`0` hides
-`run_python`/`reload_tools`), `KIT_MCP_NAME` / `KIT_MCP_INSTRUCTIONS`.
+`run_python`/`reload_tools`), `KIT_MCP_CONTENT_TOOLS` (comma list of
+`<canonical>@<owner_id>` entries whose declared MCP content, from a sealed owner,
+reaches the caller as content; unset → none, see tool-authoring.md "Answering with
+an image"), `KIT_MCP_NAME` / `KIT_MCP_INSTRUCTIONS`.
 
 ## Multiple instances on one box
 
 Ports are per-launch configuration, not global state: give each Kit process
 its own `OMNI_KIT_MCP_PORT` (a persistent install writes one default; the env
-var overrides it per launch). A configured port that is already taken — a second
+var overrides it per launch), or set `OMNI_KIT_MCP_PORT=0` in the environment and the
+bridge binds a port the kernel chooses and advertises it in its portfile, so Kits
+started together never reach for the same number. A persisted setting of 0 means no port. A configured port that is already taken — a second
 instance of the same app on the same port — refuses at startup with the reason
 (`EADDRINUSE`) rather than moving somewhere no client could predict, so give each
 instance its own port. Every instance writes its own `{pid}-{port}.json`

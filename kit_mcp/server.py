@@ -15,6 +15,14 @@ MCP server" is just this binary with a namespace filter, not a separate port:
     KIT_MCP_NAMESPACE   comma-separated namespace allowlist; unset => all.
     KIT_MCP_BUILTINS    "0" hides the bridge's bare builtins (run_python,
                         reload_tools) — the curated-agent view.
+    KIT_MCP_CONTENT_TOOLS  comma-separated ``<canonical>@<owner_id>`` entries naming the
+                        tools that may answer with MCP content blocks; unset => none.
+                        A tool is converted only when its listing declares
+                        ``content_blocks``, comes from the named owner, and that owner
+                        is ``sealed``. Unset, every tool answers with its JSON text.
+                        The seal guards against accident, not the agent: in-process
+                        run_python can forge any of this, and that is a stated residual
+                        (what it can reach it can already print as text).
     KIT_MCP_NAME / KIT_MCP_INSTRUCTIONS   cosmetic server identity.
 
 Canonical bridge names are ``<namespace>.<tool>``; MCP tool names cannot
@@ -36,6 +44,7 @@ Project-specific POLICY plugs in via three hook lists (it must not live here):
 deny-gate over a declared policy file. It, too, holds no policy.
 """
 
+import importlib.metadata
 import json
 import logging
 import os
@@ -44,7 +53,9 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, ImageContent, TextContent
 
+from . import content as content_rules
 from .client import BridgeClient, BridgeError
 
 logging.basicConfig(level=logging.INFO,
@@ -65,6 +76,34 @@ def _namespace_filter() -> Optional[set]:
     if not raw:
         return None
     return {ns.strip() for ns in raw.split(",") if ns.strip()} or None
+
+
+def _content_tools() -> Dict[str, str]:
+    """canonical name -> the owner id the launcher approved it from."""
+    approved: Dict[str, str] = {}
+    for entry in (part.strip() for part in os.getenv("KIT_MCP_CONTENT_TOOLS", "").split(",")):
+        if not entry:
+            continue
+        canonical, separator, owner = entry.partition("@")
+        if not (separator and canonical and owner):
+            logger.error(f"KIT_MCP_CONTENT_TOOLS entry {entry!r} is not <canonical>@<owner_id>; it names no tool")
+            continue
+        approved[canonical] = owner
+    return approved
+
+
+#: The oldest mcp whose FastMCP passes a tool's own CallToolResult through; an approved content tool
+#: under an older one answers an error by name instead of answering its image as text.
+CONTENT_MCP_MINIMUM = (1, 19)
+
+
+def _mcp_passes_content() -> bool:
+    try:
+        version = importlib.metadata.version("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    parts = ["".join(c for c in part if c.isdigit()) or "0" for part in version.split(".")[:2]]
+    return tuple(int(part) for part in parts) >= CONTENT_MCP_MINIMUM
 
 
 def _builtins_enabled() -> bool:
@@ -191,7 +230,7 @@ _KIND_ANNOTATIONS = {"boolean": bool, "integer": int, "number": float,
 
 
 def _build_tool_function(name: str, canonical: str, description: str,
-                         fields: List[Dict[str, Any]]):
+                         fields: List[Dict[str, Any]], content: str = "off"):
     """Build a function with a real signature/annotations for FastMCP schemas.
 
     ``fields`` are the bridge-served field specs (the schema vocabulary is
@@ -221,11 +260,14 @@ def _build_tool_function(name: str, canonical: str, description: str,
     params_str = ", ".join(param_list)
     # No docstring in the exec'd source — descriptions are arbitrary text and
     # embedding them invites quote/newline breakage; set __doc__ after.
+    # A content tool answers with a CallToolResult; every other tool answers with text, and its
+    # ``str`` return annotation is what gives it the output schema FastMCP publishes.
+    returns = "Any" if content == "on" else "str"
     func_code = (
-        f"def {name}({params_str}) -> str:\n"
-        f"    return _tool_impl({canonical!r}, locals())\n"
+        f"def {name}({params_str}) -> {returns}:\n"
+        f"    return _tool_impl({canonical!r}, locals(), {content!r})\n"
     )
-    local_ns = {"_tool_impl": _tool_implementation}
+    local_ns = {"_tool_impl": _tool_implementation, "Any": Any}
     exec(func_code, local_ns)
     func = local_ns[name]
     func.__doc__ = description
@@ -233,7 +275,7 @@ def _build_tool_function(name: str, canonical: str, description: str,
     return func
 
 
-def _tool_implementation(canonical: str, params: Dict[str, Any]) -> str:
+def _tool_implementation(canonical: str, params: Dict[str, Any], content: str = "off") -> Any:
     """Shared implementation for all dynamic tools.
 
     Every call crosses both policy hook lists, which is the point of putting them
@@ -244,7 +286,55 @@ def _tool_implementation(canonical: str, params: Dict[str, Any]) -> str:
     # policy hook judges the call the bridge will actually receive rather than the
     # signature's placeholders.
     params = {k: v for k, v in params.items() if v is not None}
-    return _post_dispatch(canonical, params, _dispatch(canonical, params))
+    if content == "unsupported":
+        version = importlib.metadata.version("mcp") if _mcp_installed() else "absent"
+        return (f"Error: KIT_MCP_CONTENT_UNSUPPORTED: {canonical} answers with images, and this gateway's mcp "
+                f"({version}) cannot pass a tool's content through; it needs >= "
+                f"{'.'.join(map(str, CONTENT_MCP_MINIMUM))}")
+    result = _post_dispatch(canonical, params, _dispatch(canonical, params))
+    return _content_answer(canonical, result) if content == "on" else result
+
+
+def _mcp_installed() -> bool:
+    try:
+        importlib.metadata.version("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
+
+
+#: The payload key of a tool whose registration declares ``content_blocks``: its result (the ``result`` of
+#: the bridge's success envelope) is exactly ``{MCP_CONTENT_KEY: [block, ...]}``, and the gateway hands
+#: the caller those MCP content blocks instead of their JSON text, which is how a tool shows the model an
+#: image. A block is ``{"type": "image", "data": <base64>, "mimeType": "image/..."}`` or
+#: ``{"type": "text", "text": ...}``. An undeclared tool's result is data whatever its shape.
+MCP_CONTENT_KEY = "mcp_content"
+
+
+def _content_answer(canonical: str, result: str) -> Any:
+    """The caller's answer: the bridge's own content blocks when it answered with them, else the text.
+
+    Content blocks travel as a ``CallToolResult`` with no ``structuredContent``: a content tool is
+    registered without an output schema, because a client that finds structured content reads it in
+    place of the blocks and the image never reaches the model. Every block is checked first
+    (``kit_mcp.content``); a refusal is an error answer naming the block's index, type and shape,
+    never a value the tool returned and never a silent fall back to the raw text."""
+    if not result.startswith("{"):
+        return result
+    try:
+        value = json.loads(result)
+    except ValueError:
+        return result
+    if not (isinstance(value, dict) and set(value) == {MCP_CONTENT_KEY}):
+        return result
+    try:
+        checked = content_rules.validate(value[MCP_CONTENT_KEY])
+    except content_rules.ContentRefusal as e:
+        logger.error(f"Refused {MCP_CONTENT_KEY} from {canonical}: {e}")
+        return f"Error: {canonical} answered with refused {MCP_CONTENT_KEY}: {MCP_CONTENT_KEY}{e}"
+    blocks = [TextContent(type="text", text=block["text"]) if block["type"] == "text" else
+              ImageContent(type="image", data=block["data"], mimeType=block["mimeType"]) for block in checked]
+    return CallToolResult(content=blocks, isError=False)
 
 
 def _dispatch(canonical: str, params: Dict[str, Any]) -> str:
@@ -300,7 +390,10 @@ def register_dynamic_tool(server: FastMCP, name: str, canonical: str,
             f"bridge served no field specs for {canonical!r} — the parameter "
             "schema is interpreted bridge-side (omni_kit_mcp.schema); update "
             "the omni.kit.mcp extension to match this gateway.")
-    handler = _build_tool_function(name, canonical, description, meta["fields"])
+    approved = (meta.get("content_blocks") is True and meta.get("sealed") is True
+                and _content_tools().get(canonical) == meta.get("owner_id"))
+    content = ("on" if _mcp_passes_content() else "unsupported") if approved else "off"
+    handler = _build_tool_function(name, canonical, description, meta["fields"], content=content)
 
     # Optional _meta category from policy hooks (failures are non-fatal).
     category = None
@@ -313,10 +406,13 @@ def register_dynamic_tool(server: FastMCP, name: str, canonical: str,
         if category is not None:
             break
 
+    # A content tool publishes no output schema: its answer is its content blocks (see _content_answer).
+    # Every other tool registers with its output schema, on any mcp 1.x.
+    options = {"structured_output": False} if content == "on" else {}
     if category is not None:
-        server.tool(meta={"category": category})(handler)
+        server.tool(meta={"category": category}, **options)(handler)
     else:
-        server.tool()(handler)
+        server.tool(**options)(handler)
 
 
 # ==================== Server ====================

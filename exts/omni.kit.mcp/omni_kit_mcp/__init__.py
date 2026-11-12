@@ -13,7 +13,7 @@ Public API:
 import importlib.util as _ilu
 
 from .autoload import load_tool_modules, prepend_tool_paths, reload_tool_module
-from .bridge import McpBridge, OwnerRegistrar, ToolDefinition, get_mcp_bridge
+from .bridge import McpBridge, OwnerRegistrar, OwnerSealed, ToolDefinition, get_mcp_bridge
 from .protocol import ToolError
 from .toolset import register_toolset
 
@@ -30,6 +30,7 @@ else:  # off-Kit: nobody instantiates the IExt, so None is safe
 __all__ = [
     "McpBridge",
     "OwnerRegistrar",
+    "OwnerSealed",
     "ToolDefinition",
     "ToolError",
     "get_mcp_bridge",

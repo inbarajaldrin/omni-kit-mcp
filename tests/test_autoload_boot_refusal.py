@@ -350,3 +350,55 @@ def test_startup_with_a_healthy_set_binds_and_refuses_nothing(
     assert quits == []
     assert "fa.t" in bridge_module._BRIDGE.get_registered_tools()
     assert not log_dir.exists() or not os.listdir(log_dir)
+
+
+def test_startup_with_an_explicit_port_0_binds_a_port_the_kernel_chooses_and_advertises_it(
+        extension, tool_dir, tmp_path, monkeypatch):
+    """Several Kits started at once on one host each ask for port 0: each bridge binds a port of its own and
+    advertises it in its portfile, where a launcher reads it back."""
+    import socket
+    from omni_kit_mcp import bridge as bridge_module, knobs
+    tool_dir("fine_a", GOOD.format(ns="fa"))
+    monkeypatch.setenv(knobs.TOOL_MODULES.env, "fine_a")
+    monkeypatch.setenv(knobs.PORT.env, "0")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime"))
+
+    extension.McpBridgeExtension().on_startup("omni.kit.mcp-test")
+    try:
+        port = bridge_module._BRIDGE._port
+        assert isinstance(port, int) and port > 0
+        socket.create_connection(("127.0.0.1", port), timeout=5).close()
+        advertised = [json.loads(path.read_text())
+                      for path in (tmp_path / "runtime" / "omni-kit-mcp").glob("*.json")]
+        assert [(row["pid"], row["port"]) for row in advertised] == [(os.getpid(), port)]
+    finally:
+        extension.McpBridgeExtension().on_shutdown()
+
+
+def test_startup_with_no_port_and_tool_modules_still_refuses(extension, tool_dir, monkeypatch):
+    from omni_kit_mcp import knobs
+    tool_dir("fine_a", GOOD.format(ns="fa"))
+    monkeypatch.setenv(knobs.TOOL_MODULES.env, "fine_a")
+    monkeypatch.delenv(knobs.PORT.env, raising=False)
+
+    with pytest.raises(RuntimeError, match="no port is set"):
+        extension.McpBridgeExtension().on_startup("omni.kit.mcp-test")
+
+
+@pytest.mark.parametrize(("env", "expected"), [(None, None), ("0", 0), ("49999", 49999)])
+def test_an_explicit_env_0_is_a_port_choice_and_unset_is_none(extension, monkeypatch, env, expected):
+    from omni_kit_mcp import knobs
+    if env is None:
+        monkeypatch.delenv(knobs.PORT.env, raising=False)
+    else:
+        monkeypatch.setenv(knobs.PORT.env, env)
+
+    assert extension._resolve_port() == expected
+
+
+def test_a_negative_port_refuses_by_name(extension, monkeypatch):
+    from omni_kit_mcp import knobs
+    monkeypatch.setenv(knobs.PORT.env, "-1")
+
+    with pytest.raises(RuntimeError, match="is not a port"):
+        extension._resolve_port()

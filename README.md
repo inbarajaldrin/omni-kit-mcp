@@ -134,6 +134,7 @@ gateway needs it.
 - **Request admission and doorway hold** — one queue with typed refusals, and a way to reserve the bridge for one caller. [docs/protocol.md](docs/protocol.md)
 - **Multiple instances and remote access** — one port per Kit process, discovery, binding beyond localhost. [docs/configuration.md](docs/configuration.md)
 - **Isaac Lab** — the bridge inside standalone train/play scripts. [docs/isaac-lab.md](docs/isaac-lab.md)
+- **Images to the model** — a sealed, launcher-named tool can answer with MCP image content, checked PNGs only. The seal guards against accident, not against agent code run in Kit, which can already print anything it reaches; the security boundary is the sandbox Kit runs in. [docs/tool-authoring.md](docs/tool-authoring.md#answering-with-an-image)
 - **Tool-author gotchas** — Kit facts that cost real debugging time. [docs/tool-authoring.md](docs/tool-authoring.md#tool-author-gotchas-kit-facts-that-cost-real-debugging-time)
 
 ## Layout

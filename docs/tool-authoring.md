@@ -23,6 +23,40 @@ Handler contract: params arrive as kwargs; return a JSON-serializable payload
 (`None` → `{}`) or raise (`ToolError` attaches diagnostics like captured
 stdout). Sync or async. The bridge owns the envelope and the main-thread hop.
 
+## Answering with an image
+
+A payload is data: the gateway hands it to the model as JSON text, so a PNG in it arrives as base64 text, never
+as an image. A tool that must show the model an image declares it at registration, `content_blocks=True`
+(`ToolDefinition` or `registrar.tool(...)`), its owner seals itself once its tools are registered
+(`registrar.seal()`), and the tool returns exactly
+
+```python
+{"mcp_content": [{"type": "image", "data": "<base64 PNG>", "mimeType": "image/png"},
+                 {"type": "text", "text": "<what the image is, in words or JSON>"}]}
+```
+
+The payload rides the success envelope's `result` like any other. `list_tools` shows `content_blocks` and `sealed`
+only when they are true: a registry with no declaring tool and no sealed owner lists neither key, and a
+declaring tool's row (or a sealed owner's) gains those keys whatever the gateway's environment. A sealed owner
+cannot be unregistered (so not reloaded), re-registered, or given another tool through the bridge's API; the bridge
+refuses `OwnerSealed`.
+
+The gateway converts a tool only when its launcher names it with its owner in `KIT_MCP_CONTENT_TOOLS`
+(`<canonical>@<owner_id>`), the listing declares `content_blocks`, and the owner is sealed. Every other tool's
+`{"mcp_content": ...}` is data. With `KIT_MCP_CONTENT_TOOLS` unset the gateway converts nothing: every tool
+registers, publishes its output schema and answers with its JSON text, on any mcp 1.x.
+
+The seal guards against accident, not against the agent. Code run through `run_python` shares the process with the bridge: it can forge a content tool, its owner and its answer by patching the bridge's private state, or simply return any bytes it can reach. That is a stated residual, not a harm the isolation exists to stop: whatever such code can reach it can already print as text, so the security boundary is the sandbox Kit runs in, not which channel the bytes leave by. What the seal does stop is a tool package, a reload or a second registration replacing an approved tool by mistake.
+
+Before conversion every block is checked (`kit_mcp/content.py`): text blocks of at most 65,536 characters;
+images only as `image/png` whose bytes are nothing but an image (IHDR, IDAT chunks and an empty IEND in that order,
+every CRC holding, no palette and no other chunk, pixel data inflating to exactly the size the header implies with no
+byte after the compressed stream, every row naming a real filter), at most 8 MiB and 16,384 pixels a side each; at most 8 blocks and 16 MiB in all. A
+refused answer is `Error: … refused mcp_content: mcp_content[i] …`, naming the block's index, type and shape, never
+its value. A converted tool publishes no output schema and answers with no structured content: a client that finds
+structured content reads it in place of the blocks (Codex does). It needs mcp >= 1.19, the first FastMCP that passes
+a tool's own result through; under an older mcp the named tool answers `Error: KIT_MCP_CONTENT_UNSUPPORTED: …`.
+
 ## Curated per-project agent views
 
 Same binary, same socket, different env:

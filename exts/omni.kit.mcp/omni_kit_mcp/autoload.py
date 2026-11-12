@@ -284,9 +284,15 @@ def load_configured_tool_modules(bridge, modules: Optional[List[str]] = None,
     attempted, results, failures = _load_each(bridge, modules, paths)
     if not failures:
         return results
+    from .bridge import OwnerSealed
+
     for mod_name in attempted:
         if mod_name not in failures:
-            bridge.unregister_owner(mod_name)
+            try:
+                bridge.unregister_owner(mod_name)
+            except OwnerSealed:
+                # A sealed owner stays; the doorway serves nothing after a boot refusal anyway.
+                pass
     raise ToolModuleLoadRefusal(failures, attempted)
 
 

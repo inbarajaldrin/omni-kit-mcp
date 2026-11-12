@@ -69,6 +69,10 @@ except ImportError:  # outside Kit (tests / lint) — stay pure-stdlib
 BUILTIN_OWNER_ID = "omni.kit.mcp"
 
 
+class OwnerSealed(ValueError):
+    """An operation the bridge refuses on a sealed owner (see ``OwnerRegistrar.seal``)."""
+
+
 @dataclass(frozen=True)
 class ToolDefinition:
     """One tool as its author declares it: local name, MCP metadata, handler.
@@ -78,6 +82,13 @@ class ToolDefinition:
     ``None`` becomes ``{}``) or raises — ``ToolError`` to attach structured
     diagnostics, anything else for a generic error. Handlers never build the
     wire envelope. ``internal`` tools are served but hidden from discovery.
+
+    ``content_blocks`` declares that the handler's payload is MCP content: exactly
+    ``{"mcp_content": [block, ...]}`` (text blocks and base64 image blocks), carried as the
+    ``result`` of the success envelope like any payload. Discovery lists the declaration. A
+    gateway hands those blocks to its caller as content only when its launcher names the tool AND
+    its owner, and the owner is sealed (``OwnerRegistrar.seal``), which is how a tool shows a model
+    an image. An undeclared tool's payload is data whatever its shape.
     """
 
     name: str
@@ -85,6 +96,7 @@ class ToolDefinition:
     parameters: Dict[str, Any]
     handler: Callable[..., Any]
     internal: bool = False
+    content_blocks: bool = False
 
 
 @dataclass(frozen=True)
@@ -134,8 +146,21 @@ class OwnerRegistrar:
         """Register one tool under this owner; returns its canonical name."""
         return self._bridge._register_tool(self.owner_id, tool)
 
+    def seal(self) -> None:
+        """Fix this owner for the bridge's lifetime: from now on it cannot be unregistered (so not
+        reloaded either), re-registered, or given another tool, and discovery says ``sealed``.
+
+        A gateway trusts a content tool only from a sealed owner its launcher names, so a tool
+        package, a reload or a second registration cannot replace the approved owner, or add a
+        content tool under it, through the bridge's API. The seal guards against accident, not
+        against the agent: code run through ``run_python`` shares this process and can forge the
+        owner, the tool and its answer by patching private state, or return any bytes it can reach.
+        That is a stated residual, not a harm the isolation exists to stop — what such code can
+        reach it can already print as text; the security boundary is the sandbox Kit runs in."""
+        self._bridge._seal_owner(self.owner_id)
+
     def tool(self, description: str, parameters: Optional[Dict[str, Any]] = None,
-             name: Optional[str] = None, internal: bool = False):
+             name: Optional[str] = None, internal: bool = False, content_blocks: bool = False):
         """Decorator sugar: ``@registrar.tool("desc", {...params})`` on a handler."""
         def decorate(fn):
             self.add(ToolDefinition(
@@ -144,6 +169,7 @@ class OwnerRegistrar:
                 parameters=parameters or {},
                 handler=fn,
                 internal=internal,
+                content_blocks=content_blocks,
             ))
             return fn
         return decorate
@@ -363,6 +389,7 @@ class McpBridge:
 
         self._lock = threading.RLock()
         self._owners: Dict[str, OwnerRegistration] = {}
+        self._sealed: set = set()   # owners fixed for the bridge's lifetime (OwnerRegistrar.seal)
         self._namespaces: Dict[str, str] = {}          # namespace -> owner_id
         self._tools: Dict[str, RegisteredTool] = {}    # canonical name -> tool
         self._owner_tools: Dict[str, Set[str]] = {}    # owner_id -> canonical names
@@ -414,6 +441,12 @@ class McpBridge:
 
     # ==================== Owner registry ====================
 
+    def _seal_owner(self, owner_id: str) -> None:
+        with self._lock:
+            if owner_id not in self._owners or owner_id in self._draining:
+                raise ValueError(f"owner {owner_id!r} is not registered")
+            self._sealed.add(owner_id)
+
     def register_owner(self, owner_id: str, namespace: str, *,
                        display_name: Optional[str] = None,
                        metadata: Optional[Dict[str, Any]] = None) -> OwnerRegistrar:
@@ -446,6 +479,8 @@ class McpBridge:
             owner = self._owners.get(owner_id)
             if owner is None or owner_id in self._draining:
                 raise ValueError(f"owner {owner_id!r} is not registered")
+            if owner_id in self._sealed:
+                raise OwnerSealed(f"owner {owner_id!r} is sealed: it takes no more tools")
             canonical = (tool.name if owner.namespace is None
                          else f"{owner.namespace}.{tool.name}")
             if canonical in self._tools:
@@ -477,6 +512,8 @@ class McpBridge:
         with self._lock:
             if owner_id not in self._owners:
                 return
+            if owner_id in self._sealed:
+                raise OwnerSealed(f"owner {owner_id!r} is sealed: it cannot be unregistered or reloaded")
             for canonical in self._owner_tools.get(owner_id, set()):
                 self._tools.pop(canonical, None)
             windows = self._owner_windows.pop(owner_id, set())
@@ -509,6 +546,9 @@ class McpBridge:
                     "fields": schema.field_specs(t.definition.parameters),
                     "namespace": t.namespace,
                     "owner_id": t.owner_id,
+                    # Present only when true, so a registry that declares no content lists neither key.
+                    **({"content_blocks": True} if t.definition.content_blocks else {}),
+                    **({"sealed": True} if t.owner_id in self._sealed else {}),
                 }
                 for t in self._tools.values()
                 if include_internal or not t.definition.internal
