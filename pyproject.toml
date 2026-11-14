@@ -3,7 +3,7 @@ name = "kit-mcp"
 version = "0.1.0"
 description = "Generic MCP server + Kit socket bridge for Omniverse Kit / Isaac Sim"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
     # Upper bound <2: mcp 2 renamed FastMCP to MCPServer and removed
